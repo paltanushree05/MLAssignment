@@ -1,3 +1,6 @@
+import os
+os.environ["HF_TOKEN"] = "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"
+
 !pip install --upgrade transformers datasets accelerate bitsandbytes fsspec==2025.3.2
 !pip install -q huggingface_hub
 !pip install -U bitsandbytes
@@ -26,7 +29,7 @@ with open("dataset/dataset.json") as f:
     full_data = json.load(f)
 
 for item in full_data:
-    base = os.path.splitext(os.path.basename(item['image']))[0] 
+    base = os.path.splitext(os.path.basename(item['image']))[0]
     item['image_path'] = f"dataset/images/{base}.png"
     item['code'] = item['asymptote']
 
@@ -88,7 +91,7 @@ class DataCollatorWithImages:
         }
 
 from huggingface_hub import login
-login(token="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")
+login(token=os.environ["HF_TOKEN"])
 from transformers import AutoTokenizer
 tokenizer = AutoTokenizer.from_pretrained("google/gemma-2b", use_auth_token=True)
 
