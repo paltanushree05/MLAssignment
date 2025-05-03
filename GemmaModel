@@ -1,0 +1,166 @@
+!pip install --upgrade transformers datasets accelerate bitsandbytes fsspec==2025.3.2
+!pip install -q huggingface_hub
+!pip install -U bitsandbytes
+!sudo apt-get update && sudo apt-get install -y asymptote
+
+import zipfile
+with zipfile.ZipFile("asymptote_sample_dataset.zip", "r") as zip_ref:
+    zip_ref.extractall("dataset")
+
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+import subprocess
+asy_folder = "dataset/code"
+img_folder = "dataset/images"
+os.makedirs(img_folder, exist_ok=True)
+for file in os.listdir(asy_folder):
+    if file.endswith(".asy"):
+        base = file.replace(".asy", "")
+        input_path = os.path.join(asy_folder, file)
+        output_path = os.path.join(img_folder, f"{base}.png")
+        subprocess.run(["asy", "-f", "png", "-o", output_path, input_path])
+
+import json
+from sklearn.model_selection import train_test_split
+with open("dataset/dataset.json") as f:
+    full_data = json.load(f)
+
+for item in full_data:
+    base = os.path.splitext(os.path.basename(item['image']))[0] 
+    item['image_path'] = f"dataset/images/{base}.png"
+    item['code'] = item['asymptote']
+
+train, test = train_test_split(full_data, test_size=0.1, random_state=42)
+train, val = train_test_split(train, test_size=0.1, random_state=42)
+
+with open("train.json", "w") as f: json.dump(train, f)
+with open("val.json", "w") as f: json.dump(val, f)
+with open("test.json", "w") as f: json.dump(test, f)
+
+from torchvision import transforms
+image_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)
+])
+
+from torch.utils.data import Dataset
+from PIL import Image
+import torch
+
+class AsymptoteMultimodalDataset(Dataset):
+    def __init__(self, data, tokenizer, transform, max_length=256):
+        self.data = data
+        self.tokenizer = tokenizer
+        self.transform = transform
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        image = Image.open(item['image_path']).convert("RGB")
+        image_tensor = self.transform(image)
+        tokens = self.tokenizer(item['code'], padding='max_length', truncation=True, max_length=self.max_length, return_tensors="pt")
+        return {
+            "pixel_values": image_tensor,
+            "input_ids": tokens['input_ids'].squeeze(),
+            "attention_mask": tokens['attention_mask'].squeeze(),
+            "labels": tokens['input_ids'].squeeze()
+        }
+
+from torch.nn.utils.rnn import pad_sequence
+class DataCollatorWithImages:
+    def __init__(self, tokenizer):
+        self.tokenizer = tokenizer
+
+    def __call__(self, batch):
+        pixel_values = torch.stack([item["pixel_values"] for item in batch])
+        input_ids = pad_sequence([item["input_ids"] for item in batch], batch_first=True, padding_value=self.tokenizer.pad_token_id)
+        attention_mask = pad_sequence([item["attention_mask"] for item in batch], batch_first=True, padding_value=0)
+        labels = pad_sequence([item["labels"] for item in batch], batch_first=True, padding_value=-100)
+        return {
+            "pixel_values": pixel_values,
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels
+        }
+
+from huggingface_hub import login
+login(token="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")
+from transformers import AutoTokenizer
+tokenizer = AutoTokenizer.from_pretrained("google/gemma-2b", use_auth_token=True)
+
+from transformers import CLIPModel, AutoModelForCausalLM
+import torch.nn as nn
+
+class ImageToCodeModel(nn.Module):
+    def __init__(self, vision_model_name="openai/clip-vit-base-patch32", language_model_name="google/gemma-2b"):
+        super(ImageToCodeModel, self).__init__()
+        self.vision_model = CLIPModel.from_pretrained(vision_model_name).vision_model
+        self.vision_proj = nn.Linear(self.vision_model.config.hidden_size, 256)
+        self.language_model = AutoModelForCausalLM.from_pretrained(language_model_name)
+        self.prefix_length = 3
+        self.prefix_mlp = nn.Sequential(
+            nn.Linear(256, self.prefix_length * self.language_model.config.hidden_size),
+            nn.Tanh()
+        )
+
+    def forward(self, pixel_values, input_ids, attention_mask=None, labels=None):
+        vision_out = self.vision_model(pixel_values=pixel_values)
+        image_emb = vision_out.last_hidden_state[:, 0, :]
+        image_proj = self.vision_proj(image_emb)
+        prefix = self.prefix_mlp(image_proj).view(-1, self.prefix_length, self.language_model.config.hidden_size)
+        text_emb = self.language_model.model.embed_tokens(input_ids)
+        full_emb = torch.cat((prefix, text_emb), dim=1)
+
+        if attention_mask is not None:
+            prefix_mask = torch.ones((attention_mask.size(0), self.prefix_length), dtype=attention_mask.dtype).to(attention_mask.device)
+            attention_mask = torch.cat((prefix_mask, attention_mask), dim=1)
+
+        return self.language_model(
+            inputs_embeds=full_emb,
+            attention_mask=attention_mask,
+            labels=labels
+        )
+
+model = ImageToCodeModel()
+model.language_model.gradient_checkpointing_enable()
+train_dataset = AsymptoteMultimodalDataset(train, tokenizer, image_transform)
+val_dataset = AsymptoteMultimodalDataset(val, tokenizer, image_transform)
+
+from transformers import TrainingArguments, Trainer
+
+training_args = TrainingArguments(
+    output_dir="./gemma-image2code",
+    per_device_train_batch_size=1,
+    per_device_eval_batch_size=1,
+    gradient_accumulation_steps=1,
+    num_train_epochs=3,
+    learning_rate=5e-5,
+    warmup_steps=100,
+    weight_decay=0.01,
+    logging_dir="./logs",
+    logging_steps=50,
+    save_steps=500,
+    save_total_limit=2,
+    fp16=True
+)
+
+collator = DataCollatorWithImages(tokenizer)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=val_dataset,
+    tokenizer=tokenizer,
+    data_collator=collator
+)
+
+import torch
+torch.cuda.empty_cache()
+trainer.train()
+trainer.save_model("./gemma-image2code")
+tokenizer.save_pretrained("./gemma-image2code")
